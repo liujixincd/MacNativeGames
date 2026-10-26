@@ -108,6 +108,7 @@ uint64_t runtime_output_size_current(void);              /* configured canvas: w
 void runtime_warm_progress(uint64_t done,uint64_t total,uint64_t shaders,uint64_t shader_total,uint64_t pipelines,uint64_t pipeline_total);
 void runtime_warm_done(void);
 void runtime_game_slot_acquire(const char *mode);   /* runtime/game_slot.c: one game at a time */
+void runtime_cheats_backup(void);   /* after acquiring the game slot, before loading guest code */
 void *runtime_front_override(const char *name);
 int runtime_front_focus(void);
 void runtime_settings_toggle(void);   /* key 1 (runtime/input.c): the settings panel opens or closes (frontend.m; nothing on the phone) */

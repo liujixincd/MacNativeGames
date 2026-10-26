@@ -53,6 +53,7 @@ REPO = Path(__file__).resolve().parent
 GAME = REPO / 'games/totk'
 sys.path.insert(0, str(GAME/'scripts'))
 import mod_folder                  # noqa: E402  the player's RomFS mod folder: replaced only when --install-mod-romfs is given
+import cheat_mod                   # static cheat selections use the checked mod pipeline
 EXPECTED = json.loads((GAME / 'assets/expected-v1.0.0.json').read_text())
 UPDATED = json.loads((GAME / 'assets/expected-v1.1.2.json').read_text())
 UPDATED121 = json.loads((GAME / 'assets/expected-v1.2.1.json').read_text())
@@ -551,7 +552,7 @@ def merge_mod_exefs(tree, mod, version, logs):
     return merged, report_path
 
 
-def step_code(tree, game, keys, env, logs, *, version="v0", mod=None):
+def step_code(tree, game, keys, env, logs, *, version="v0", mod=None, cheats=None):
     expected = VERSIONS[version]
     update_args = [] if version == "v0" else ["--update"]
     py = tree / '.venv/bin/python'
@@ -579,6 +580,16 @@ def step_code(tree, game, keys, env, logs, *, version="v0", mod=None):
                 f"key generation); the game does not use it and the code must match {expected['display_version']}; using it")
             continue
         check(f'ExeFS {n}', got, h)
+    cheat_report = None
+    if cheats:
+        cheat_file, names = cheats
+        # main was verified against the version's retail hash above.
+        build_id = (exefs / 'main').read_bytes()[0x40:0x54].hex()
+        try:
+            mod, cheat_report = cheat_mod.prepare_mod(cheat_file, names, build_id,
+                                                      tree / 'analysis/cheats', base_mod=mod)
+        except (OSError, cheat_mod.CheatError) as error:
+            raise BuildError(f'cheats: {error}') from error
     merged, merged_path = merge_mod_exefs(tree, mod, version, logs) if mod else (None, None)
     if not (tree / f'extracted/{version}/elf/main-inventory.json').exists():
         run([py, 'scripts/prepare_modules.py', exefs, '--output', tree / f'extracted/{version}/elf'], logs / 'prepare_modules.log', cwd=tree)
@@ -616,6 +627,8 @@ def step_code(tree, game, keys, env, logs, *, version="v0", mod=None):
                                     ('folder', 'folder_sha256', 'build_id', 'patches', 'edit_bytes', 'reserved_sites',
                                      'retail_main_sha256', 'patched_main_sha256', 'rewritten_main_sha256',
                                      'rewriter_sha256', 'notes')}} if merged else {}))
+    if cheat_report:
+        report['cheats'] = cheat_report
     report_path = tree / ('analysis/phase12-validation.json' if version == 'v0' else f'analysis/{version}-port/phase12-validation.json')
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2) + '\n')
@@ -1225,6 +1238,11 @@ def place_game_data(tree, res, version):
         raise BuildError(f'{data}: {", ".join(missing)} missing (games/totk/Makefile game-data-{version})')
     for name in game_data_files(version):
         clone(data / name, dst / name)
+    report_path = tree / ('analysis/phase12-validation.json' if version == 'v0' else f'analysis/{version}-port/phase12-validation.json')
+    if report_path.is_file():
+        selected = json.loads(report_path.read_text()).get('cheats')
+        if selected:
+            (dst / 'cheats-selection.json').write_text(json.dumps(selected, indent=2) + '\n')
     aliases = tree / f'build/shader-seed/{version}.aliases.tsv'   # listed variants the seed carries under another name
     if aliases.is_file():
         clone(aliases, dst / 'shader-seed.aliases.tsv')
@@ -1860,6 +1878,11 @@ def parse_args(argv):
                     help='a mod folder prepared before the build: its exefs/ IPS / IPS32 / pchtxt patches for the main '
                          'module are merged into the code before it is rewritten (its romfs/ goes in with '
                          '--install-mod-romfs; docs/mods.md)')
+    ap.add_argument('--cheats', type=Path, metavar='BUILD_ID.txt',
+                    help='TOTK static main-module cheats in Atmosphere format; merged before rewriting, '
+                         'with build-ID and reserved-site checks (games/totk/docs/cheats.md)')
+    ap.add_argument('--enable-cheat', action='append', default=[], metavar='NAME',
+                    help='exact [name] from --cheats; repeat to select more; all ordinary cheats start disabled')
     ap.add_argument('--install-mod-romfs', action='store_true',
                     help='with --mod: at the end of the build, replace <data>/mods/<version> with the mod\'s romfs/ '
                          'and its manifest.tsv, so the app plays with the mod. That folder is the player\'s: what it '
@@ -1875,6 +1898,24 @@ def parse_args(argv):
 
 def main(argv):
     args = parse_args(argv)
+    if args.enable_cheat and not args.cheats:
+        raise BuildError('--enable-cheat requires --cheats <BUILD_ID.txt>')
+    if args.cheats:
+        if args.platform != 'macos':
+            raise BuildError('--cheats currently supports macOS builds only')
+        if not args.enable_cheat:
+            raise BuildError('--cheats requires at least one --enable-cheat NAME (no cheats are enabled by default)')
+        args.cheats = args.cheats.expanduser().resolve()
+        try:
+            sections, _ = cheat_mod.load_cheats(args.cheats)
+            for name in args.enable_cheat:
+                if name not in sections or sections[name]['master'] or not sections[name]['words']:
+                    raise cheat_mod.CheatError(f'unknown, empty or master cheat selection: {name}')
+            for name, section in sections.items():
+                if name in args.enable_cheat or section['master']:
+                    cheat_mod.static_writes(name, section['words'])
+        except (OSError, cheat_mod.CheatError) as error:
+            raise BuildError(f'cheats: {error}') from error
     device_app = args.platform in ('ios', 'visionos')
     game, keys = args.game.expanduser().resolve(), args.keys.expanduser().resolve()
     if not game.is_file():
@@ -1938,6 +1979,8 @@ def main(argv):
     if dlcs and which != 'botw':
         raise BuildError(f'{APPS[which][0]} has no DLC support: leave out --dlc')
     if which == 'botw':
+        if args.cheats:
+            raise BuildError('--cheats is currently supported for Tears of the Kingdom only')
         if args.platform == 'visionos':
             raise BuildError('Breath of the Wild has no native Vision Pro build yet: use --platform macos or ios')
         if fresh_work and not args.work:   # BotW_build next to the game file, not TOTK_build
@@ -2030,10 +2073,12 @@ def main(argv):
             f'<folder>.backup-<date>-<time>, not deleted. Without the flag the build leaves the folder alone.')
     if update:
         version, update = identify_update(tree, update, keys, logs)
-    step_code(tree, game, keys, env, logs, mod=None if update else code_mod)
+    selected_cheats = (args.cheats, args.enable_cheat) if args.cheats else None
+    step_code(tree, game, keys, env, logs, mod=None if update else code_mod,
+              **({'cheats': selected_cheats} if selected_cheats and not update else {}))
     if update:
         step_code(tree, update, keys, env, logs, version=version,
-                  mod=code_mod)   # a mod is for the updated main, not for 1.0.0
+                  mod=code_mod, **({'cheats': selected_cheats} if selected_cheats else {}))   # selected build only
     step_data(tree, game, keys, logs, firmware=firmware, shared_fonts=shared_fonts, mod=None if update else mod)
     if update:
         step_update_data(tree, game, update, keys, logs, version=version, mod=mod)
